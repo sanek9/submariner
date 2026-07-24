@@ -55,6 +55,7 @@ import (
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/environment"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/awsvpc"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/calico"
+	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/cilium"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/healthchecker"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/kubeproxy"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/mtu"
@@ -166,6 +167,28 @@ func main() {
 		cabledriver.NewXRFMCleanupHandler(),
 		cabledriver.NewVXLANCleanup(),
 		calico.NewCalicoIPPoolHandler(cfg, env.Namespace, dynamicClientSet),
+	)
+
+	var pubEnv cilium.PublisherEnv
+
+	logger.FatalOnError(envconfig.Process("submariner", &pubEnv), "Error processing Cilium CM publisher env vars")
+
+	handlers = append(handlers,
+		cilium.NewClusterMeshPublisher(k8sClientSet, &cilium.PublisherConfig{
+			RemoteName:         pubEnv.CiliumCMRemoteName,
+			ClusterID:          pubEnv.CiliumCMClusterID,
+			ListenClientURL:    pubEnv.CiliumCMListenURL,
+			AdvertiseClientURL: pubEnv.CiliumCMListenURL,
+			ListenPeerURL:      pubEnv.CiliumCMPeerURL,
+			AdvertisePeerURL:   pubEnv.CiliumCMPeerURL,
+			DataDir:            pubEnv.CiliumCMDataDir,
+			CertFile:           pubEnv.CiliumCMCertFile,
+			KeyFile:            pubEnv.CiliumCMKeyFile,
+			CAFile:             pubEnv.CiliumCMCAFile,
+			LocalNodeName:      localNode.Name,
+			LocalNodeIP:        cilium.InternalIPv4(localNode),
+			PreferredHostIP:    pubEnv.CiliumCMHostIP,
+		}),
 		healthchecker.New(&healthchecker.Config{
 			ControllerConfig: pinger.ControllerConfig{
 				SupportedIPFamilies: submSpec.GetIPFamilies(),
