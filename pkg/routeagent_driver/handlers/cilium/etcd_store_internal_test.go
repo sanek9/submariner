@@ -24,12 +24,15 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/pkg/errors"
 	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/cilium/fake"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 var _ = Describe("etcdStore", func() {
@@ -124,7 +127,99 @@ var _ = Describe("etcdStore", func() {
 		Expect(json.Unmarshal(resp.Kvs[0].Value, &pair)).To(Succeed())
 		Expect(pair.HostIP.String()).To(Equal("10.0.0.2"))
 	})
+
+	// Cilium ClusterMesh syncs ipcache via ListAndWatch; a Get-only peer is not enough.
+	It("should deliver prefix Watch events for route upsert and delete", func(ctx context.Context) {
+		clientPort := freeTCPPort()
+		clientURL := fmt.Sprintf("http://127.0.0.1:%d", clientPort)
+
+		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
+			ListenClientURL:    clientURL,
+			AdvertiseClientURL: clientURL,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			Expect(store.Close()).To(Succeed())
+		})
+
+		cli, err := clientv3.New(clientv3.Config{
+			Endpoints:   []string{clientURL},
+			DialTimeout: 5 * time.Second,
+		})
+		Expect(err).NotTo(HaveOccurred())
+		DeferCleanup(func() {
+			_ = cli.Close()
+		})
+
+		watchCtx, cancelWatch := context.WithCancel(ctx)
+		DeferCleanup(cancelWatch)
+
+		wch := cli.Watch(watchCtx, cmIPStatePrefix+"/", clientv3.WithPrefix())
+
+		var (
+			mu     sync.Mutex
+			events []*clientv3.Event
+		)
+
+		go func() {
+			for wr := range wch {
+				if wr.Err() != nil {
+					return
+				}
+
+				mu.Lock()
+				events = append(events, wr.Events...)
+				mu.Unlock()
+			}
+		}()
+
+		// Allow the watch stream to attach before mutating keys.
+		time.Sleep(200 * time.Millisecond)
+
+		const (
+			routeCIDR = "10.151.0.0/16"
+			hostIP    = "10.0.0.2"
+		)
+
+		routeKey := ipIdentityKey(routeCIDR)
+
+		Expect(store.UpsertRoute(ctx, routeCIDR, hostIP, 255)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			g.Expect(findWatchEvent(events, mvccpb.PUT, routeKey)).NotTo(BeNil())
+		}).WithTimeout(5 * time.Second).Should(Succeed())
+
+		Expect(store.DeleteRoute(ctx, routeCIDR)).To(Succeed())
+
+		Eventually(func(g Gomega) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			g.Expect(findWatchEvent(events, mvccpb.DELETE, routeKey)).NotTo(BeNil())
+		}).WithTimeout(5 * time.Second).Should(Succeed())
+	})
 })
+
+func findWatchEvent(events []*clientv3.Event, typ mvccpb.Event_EventType, key string) *clientv3.Event {
+	for _, ev := range events {
+		if ev == nil || ev.Type != typ {
+			continue
+		}
+
+		if ev.Kv != nil && string(ev.Kv.Key) == key {
+			return ev
+		}
+
+		if ev.PrevKv != nil && string(ev.PrevKv.Key) == key {
+			return ev
+		}
+	}
+
+	return nil
+}
 
 func freeTCPPort() int {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
