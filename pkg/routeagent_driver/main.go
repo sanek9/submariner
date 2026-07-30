@@ -173,16 +173,15 @@ func main() {
 
 	handlers = append(handlers,
 		cilium.NewClusterMeshPublisher(k8sClientSet, &cilium.PublisherConfig{
-			RemoteName:         pubEnv.CiliumCMRemoteName,
-			ClusterID:          pubEnv.CiliumCMClusterID,
-			ListenClientURL:    pubEnv.CiliumCMListenURL,
-			AdvertiseClientURL: pubEnv.CiliumCMListenURL,
-			CertFile:           pubEnv.CiliumCMCertFile,
-			KeyFile:            pubEnv.CiliumCMKeyFile,
-			CAFile:             pubEnv.CiliumCMCAFile,
-			LocalNodeName:      localNode.Name,
-			LocalNodeIP:        cilium.InternalIPv4(localNode),
-			PreferredHostIP:    pubEnv.CiliumCMHostIP,
+			RemoteName:      pubEnv.CiliumCMRemoteName,
+			ClusterID:       pubEnv.CiliumCMClusterID,
+			ListenClientURL: pubEnv.CiliumCMListenURL,
+			CertFile:        pubEnv.CiliumCMCertFile,
+			KeyFile:         pubEnv.CiliumCMKeyFile,
+			CAFile:          pubEnv.CiliumCMCAFile,
+			LocalNodeName:   localNode.Name,
+			LocalNodeIP:     cilium.InternalIPv4(localNode),
+			PreferredHostIP: pubEnv.CiliumCMHostIP,
 		}),
 		healthchecker.New(&healthchecker.Config{
 			ControllerConfig: pinger.ControllerConfig{

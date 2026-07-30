@@ -51,11 +51,10 @@ var _ = Describe("kine kvstore TLS with client cert auth", func() {
 		clientURL := fmt.Sprintf("https://127.0.0.1:%d", clientPort)
 
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			ListenClientURL:    clientURL,
-			AdvertiseClientURL: clientURL,
-			CertFile:           paths.serverCert,
-			KeyFile:            paths.serverKey,
-			CAFile:             paths.caCert,
+			ListenClientURL: clientURL,
+			CertFile:        paths.serverCert,
+			KeyFile:         paths.serverKey,
+			CAFile:          paths.caCert,
 		})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
@@ -106,14 +105,13 @@ var _ = Describe("ClusterMesh publisher TLS with client cert auth", func() {
 			newNodeWithIP("node-local", localIP),
 			newNodeWithIP("node-gw", gatewayIP),
 		), &PublisherConfig{
-			LocalNodeIP:        localIP,
-			RemoteName:         "submariner",
-			ClusterID:          255,
-			ListenClientURL:    clientURL,
-			AdvertiseClientURL: clientURL,
-			CertFile:           paths.serverCert,
-			KeyFile:            paths.serverKey,
-			CAFile:             paths.caCert,
+			LocalNodeIP:     localIP,
+			RemoteName:      "submariner",
+			ClusterID:       255,
+			ListenClientURL: clientURL,
+			CertFile:        paths.serverCert,
+			KeyFile:         paths.serverKey,
+			CAFile:          paths.caCert,
 		})
 		support.Start(ctx, h)
 

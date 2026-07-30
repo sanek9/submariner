@@ -19,12 +19,12 @@ limitations under the License.
 // Package cilium provides a Route Agent handler for clusters using the Cilium CNI.
 //
 // The ClusterMesh publisher runs an in-memory etcd-compatible kvstore (kine) and
-// publishes remote Submariner CIDRs as Cilium ClusterMesh IPIdentityPair keys
-// (CIDR→HostIP) so Host:BPF agents program ipcache tunnelendpoint. It activates
-// when SUBMARINER_NETWORKPLUGIN=cilium. Incompatible with real Cilium ClusterMesh
-// unless carefully isolated (alpha). Cert paths/URLs via SUBMARINER_CILIUM_CM_*
-// env. Operator/subctl should distribute matching TLS material to route-agent and
-// Secret cilium-clustermesh.
+// publishes remote Submariner IPv4 CIDRs as Cilium ClusterMesh IPIdentityPair keys
+// (CIDR→HostIP) so Host:BPF agents program ipcache tunnelendpoint. IPv6 subnets
+// are ignored (alpha). It activates when SUBMARINER_NETWORKPLUGIN=cilium.
+// Incompatible with real Cilium ClusterMesh unless carefully isolated. Cert
+// paths/URLs via SUBMARINER_CILIUM_CM_* env. Operator/subctl should distribute
+// matching TLS material to route-agent and Secret cilium-clustermesh.
 //
 // See https://github.com/submariner-io/submariner/issues/3168.
 package cilium
@@ -68,14 +68,13 @@ type PublisherConfig struct {
 	// EtcdClient, when set, backs the store without starting the kvstore (tests).
 	EtcdClient EtcdClient
 	// RemoteName is the synthetic Cilium ClusterMesh peer name (Secret key prefix).
-	RemoteName         string
-	ListenClientURL    string
-	AdvertiseClientURL string
-	CertFile           string
-	KeyFile            string
-	CAFile             string
-	LocalNodeName      string
-	LocalNodeIP        string
+	RemoteName      string
+	ListenClientURL string
+	CertFile        string
+	KeyFile         string
+	CAFile          string
+	LocalNodeName   string
+	LocalNodeIP     string
 	// PreferredHostIP overrides automatic HostIP selection when set and ≠ LocalNodeIP.
 	// On the Submariner gateway, SelectHostIP prefers cilium_host when no override is set.
 	PreferredHostIP string
@@ -140,10 +139,6 @@ func applyPublisherDefaults(cfg *PublisherConfig) {
 	if cfg.ListenClientURL == "" {
 		cfg.ListenClientURL = defaultCMClientURL
 	}
-
-	if cfg.AdvertiseClientURL == "" {
-		cfg.AdvertiseClientURL = cfg.ListenClientURL
-	}
 }
 
 func (h *clusterMeshPublisher) GetNetworkPlugins() []string {
@@ -163,11 +158,10 @@ func (h *clusterMeshPublisher) Init(ctx context.Context) error {
 		h.store = newEtcdStoreWithClient(h.cfg.EtcdClient)
 	} else {
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			ListenClientURL:    h.cfg.ListenClientURL,
-			AdvertiseClientURL: h.cfg.AdvertiseClientURL,
-			CertFile:           h.cfg.CertFile,
-			KeyFile:            h.cfg.KeyFile,
-			CAFile:             h.cfg.CAFile,
+			ListenClientURL: h.cfg.ListenClientURL,
+			CertFile:        h.cfg.CertFile,
+			KeyFile:         h.cfg.KeyFile,
+			CAFile:          h.cfg.CAFile,
 		})
 		if err != nil {
 			return errors.Wrap(err, "start ClusterMesh publisher kvstore")
@@ -191,6 +185,8 @@ func (h *clusterMeshPublisher) Init(ctx context.Context) error {
 		if stopErr := h.store.Close(); stopErr != nil {
 			logger.Errorf(stopErr, "error closing store after Init failure")
 		}
+
+		h.started = false
 
 		return err
 	}
@@ -337,13 +333,17 @@ func (h *clusterMeshPublisher) setGatewayIP(endpoint *submV1.Endpoint) {
 
 func (h *clusterMeshPublisher) reconcile(ctx context.Context) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	if !h.started {
+		h.mu.Unlock()
 		return nil
 	}
 
-	hostIP, err := h.resolveHostIP(ctx)
+	store := h.store
+	gatewayIP := h.gatewayIP
+	needBootstrap := !h.bootstrapped
+	h.mu.Unlock()
+
+	hostIP, err := h.resolveHostIP(ctx, gatewayIP)
 	if err != nil {
 		logger.Warningf("Cilium ClusterMesh publisher: cannot select HostIP on node %q: %v",
 			h.cfg.LocalNodeName, err)
@@ -351,48 +351,102 @@ func (h *clusterMeshPublisher) reconcile(ctx context.Context) error {
 		return nil
 	}
 
-	if !h.bootstrapped {
-		if err := h.store.Bootstrap(ctx, h.cfg.RemoteName, h.cfg.ClusterID); err != nil {
+	if needBootstrap {
+		if err := store.Bootstrap(ctx, h.cfg.RemoteName, h.cfg.ClusterID); err != nil {
 			return errors.Wrap(err, "bootstrap ClusterMesh publisher")
 		}
 
-		h.bootstrapped = true
+		h.mu.Lock()
+		if h.started {
+			h.bootstrapped = true
+		}
+		h.mu.Unlock()
 	}
 
 	desired := h.desiredRemoteCIDRs()
-	desiredSet := make(map[string]struct{}, len(desired))
+	if err := h.publishDesiredRoutes(ctx, store, hostIP, desired); err != nil {
+		return err
+	}
 
+	return h.deleteStaleRoutes(ctx, store, desired)
+}
+
+func (h *clusterMeshPublisher) publishDesiredRoutes(
+	ctx context.Context, store *etcdStore, hostIP string, desired []string,
+) error {
 	for _, c := range desired {
-		desiredSet[c] = struct{}{}
+		h.mu.Lock()
+		prev, ok := h.published[c]
+		stillRunning := h.started
+		h.mu.Unlock()
 
-		if prev, ok := h.published[c]; ok && prev == hostIP {
+		if !stillRunning {
+			return nil
+		}
+
+		if ok && prev == hostIP {
 			continue
 		}
 
-		if err := h.store.UpsertRoute(ctx, c, hostIP, h.cfg.ClusterID); err != nil {
+		if err := store.UpsertRoute(ctx, c, hostIP, h.cfg.ClusterID); err != nil {
 			return errors.Wrapf(err, "upsert route %s -> %s", c, hostIP)
 		}
 
-		h.published[c] = hostIP
+		h.mu.Lock()
+		if h.started {
+			h.published[c] = hostIP
+		}
+		h.mu.Unlock()
+
 		logger.Infof("Published Cilium CM route %s HostIP=%s (node=%q)", c, hostIP, h.cfg.LocalNodeName)
 	}
 
+	return nil
+}
+
+func (h *clusterMeshPublisher) deleteStaleRoutes(ctx context.Context, store *etcdStore, desired []string) error {
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, c := range desired {
+		desiredSet[c] = struct{}{}
+	}
+
+	h.mu.Lock()
+	stale := make([]string, 0, len(h.published))
+
 	for c := range h.published {
-		if _, ok := desiredSet[c]; ok {
-			continue
+		if _, ok := desiredSet[c]; !ok {
+			stale = append(stale, c)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range stale {
+		h.mu.Lock()
+		stillRunning := h.started
+		h.mu.Unlock()
+
+		if !stillRunning {
+			return nil
 		}
 
-		if err := h.store.DeleteRoute(ctx, c); err != nil {
+		if err := store.DeleteRoute(ctx, c); err != nil {
 			return errors.Wrapf(err, "delete route %s", c)
 		}
 
-		delete(h.published, c)
+		h.mu.Lock()
+		if h.started {
+			delete(h.published, c)
+		}
+		h.mu.Unlock()
+
 		logger.Infof("Deleted Cilium CM route %s (node=%q)", c, h.cfg.LocalNodeName)
 	}
 
 	return nil
 }
 
+// desiredRemoteCIDRs returns unique IPv4 Submariner remote endpoint subnets.
+// IPv6 is out of scope for this alpha publisher.
 func (h *clusterMeshPublisher) desiredRemoteCIDRs() []string {
 	desired := make([]string, 0, len(h.State().GetRemoteEndpoints()))
 
@@ -406,7 +460,7 @@ func (h *clusterMeshPublisher) desiredRemoteCIDRs() []string {
 	return slices.Compact(desired)
 }
 
-func (h *clusterMeshPublisher) resolveHostIP(ctx context.Context) (string, error) {
+func (h *clusterMeshPublisher) resolveHostIP(ctx context.Context, gatewayIP string) (string, error) {
 	nodeIPs, err := h.listHostIPCandidateIPs(ctx)
 	if err != nil {
 		return "", err
@@ -414,7 +468,7 @@ func (h *clusterMeshPublisher) resolveHostIP(ctx context.Context) (string, error
 
 	overlayIP, _ := CiliumHostIPv4(nil)
 
-	return SelectHostIP(h.cfg.LocalNodeIP, h.gatewayIP, h.cfg.PreferredHostIP, nodeIPs, overlayIP)
+	return SelectHostIP(h.cfg.LocalNodeIP, gatewayIP, h.cfg.PreferredHostIP, nodeIPs, overlayIP)
 }
 
 func (h *clusterMeshPublisher) listHostIPCandidateIPs(ctx context.Context) ([]string, error) {

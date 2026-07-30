@@ -49,11 +49,10 @@ const (
 
 // EtcdStoreConfig configures an in-memory etcd-compatible ClusterMesh peer (kine).
 type EtcdStoreConfig struct {
-	ListenClientURL    string
-	AdvertiseClientURL string
-	CertFile           string
-	KeyFile            string
-	CAFile             string
+	ListenClientURL string
+	CertFile        string
+	KeyFile         string
+	CAFile          string
 }
 
 type etcdStore struct {
@@ -213,7 +212,7 @@ func newLocalEtcdClient(cfg *EtcdStoreConfig) (*clientv3.Client, error) {
 func localClientEndpoint(cfg *EtcdStoreConfig) string {
 	u, err := url.Parse(cfg.ListenClientURL)
 	if err != nil {
-		return cfg.AdvertiseClientURL
+		return cfg.ListenClientURL
 	}
 
 	scheme := u.Scheme
@@ -254,10 +253,6 @@ func listenAddrAndScheme(listenURL string, cfg *EtcdStoreConfig) (string, string
 func setEtcdStoreDefaults(cfg *EtcdStoreConfig) {
 	if cfg.ListenClientURL == "" {
 		cfg.ListenClientURL = "http://" + loopbackHost + ":12379"
-	}
-
-	if cfg.AdvertiseClientURL == "" {
-		cfg.AdvertiseClientURL = cfg.ListenClientURL
 	}
 }
 

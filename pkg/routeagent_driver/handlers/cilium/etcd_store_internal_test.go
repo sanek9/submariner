@@ -75,8 +75,7 @@ var _ = Describe("etcdStore", func() {
 		clientURL := fmt.Sprintf("http://127.0.0.1:%d", clientPort)
 
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			ListenClientURL:    clientURL,
-			AdvertiseClientURL: clientURL,
+			ListenClientURL: clientURL,
 		})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -134,8 +133,7 @@ var _ = Describe("etcdStore", func() {
 		clientURL := fmt.Sprintf("http://127.0.0.1:%d", clientPort)
 
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			ListenClientURL:    clientURL,
-			AdvertiseClientURL: clientURL,
+			ListenClientURL: clientURL,
 		})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {
@@ -168,6 +166,7 @@ var _ = Describe("etcdStore", func() {
 				}
 
 				mu.Lock()
+
 				events = append(events, wr.Events...)
 				mu.Unlock()
 			}
