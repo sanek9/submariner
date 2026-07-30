@@ -127,9 +127,21 @@ func main() {
 	configMap, err := configmap.Get(ctx, resource.ForConfigMap(k8sClientSet, env.Namespace), names.RouteAgentComponent)
 	logger.FatalOnError(err, "Error retrieving ConfigMap")
 
+	routeTablesCM, err := configmap.Get(ctx, resource.ForConfigMap(k8sClientSet, env.Namespace), kubeproxy.RouteTablesConfigMap)
+	logger.FatalOnError(err, "Error retrieving route-tables ConfigMap")
+
+	routeTables, err := kubeproxy.ParseRouteTables(routeTablesCM.Data[kubeproxy.RouteTablesKey])
+	logger.FatalOnError(err, "Error parsing route-tables ConfigMap")
+
+	if len(routeTables) > 0 {
+		logger.Infof("Replicating inter-cluster routes into tables %v from ConfigMap %q",
+			routeTables, kubeproxy.RouteTablesConfigMap)
+	}
+
 	global.Init(globalConfigMap, configMap)
 
-	configmap.WatchAndSignalOnChange(ctx, k8sClientSet, env.Namespace, syscall.SIGINT, configmap.Global, names.RouteAgentComponent)
+	configmap.WatchAndSignalOnChange(ctx, k8sClientSet, env.Namespace, syscall.SIGINT, configmap.Global,
+		names.RouteAgentComponent, kubeproxy.RouteTablesConfigMap)
 
 	pfconfigure.DriverFromGlobalConfig()
 
@@ -154,7 +166,7 @@ func main() {
 
 	for _, family := range cidr.ExtractIPFamilies(env.ClusterCidr) {
 		handlers = append(handlers,
-			kubeproxy.NewSyncHandler(family, env.ClusterCidr, env.ServiceCidr),
+			kubeproxy.NewSyncHandler(family, env.ClusterCidr, env.ServiceCidr, routeTables),
 			mtu.NewHandler(family, env.ClusterCidr, len(env.GlobalCidr) != 0, getTCPMssValue(localNode)))
 
 		handlers = append(handlers, ovn.GetHandlers(family, &env, smClientset, k8sClientSet, dynamicClientSet, config)...)

@@ -35,6 +35,7 @@ var _ = Describe("SyncHandler", func() {
 	Describe("Nodes", testNodes)
 	Describe("Uninstall", testUninstall)
 	Describe("Dual-stack", testDualStack)
+	Describe("Route tables ConfigMap", testRouteTables)
 })
 
 func testNodes() {
@@ -84,6 +85,65 @@ func testUninstall() {
 			t.netLink.AwaitNoRule(constants.RouteAgentHostNetworkTableID, "", "")
 			t.netLink.AwaitNoLink(kubeproxy.GetVxLANInterfaceName(k8snet.IPv4))
 			t.verifyNoHostNetworkingRoutes()
+		})
+	})
+}
+
+func testRouteTables() {
+	const (
+		routeTable1 = 2
+		routeTable2 = 3
+	)
+
+	t := newTestDriver()
+
+	BeforeEach(func() {
+		t.routeTables = []int{routeTable1, routeTable2}
+	})
+
+	When("a remote Endpoint is created on a non-gateway node", func() {
+		JustBeforeEach(func(ctx context.Context) {
+			t.CreateEndpoint(ctx, t.localEndpoint)
+			t.CreateEndpoint(ctx, t.remoteEndpoint)
+		})
+
+		It("should replicate VxLAN routes into the configured tables", func() {
+			t.verifyVxLANRoutes()
+			t.verifyRouteTables()
+		})
+
+		Context("and is subsequently removed", func() {
+			JustBeforeEach(func(ctx context.Context) {
+				t.DeleteEndpoint(ctx, t.remoteEndpoint.Name)
+			})
+
+			It("should remove the replicated routes", func() {
+				t.verifyNoVxLANRoutes()
+				t.verifyNoRouteTables()
+			})
+		})
+	})
+
+	When("a remote Endpoint is created on a gateway node", func() {
+		JustBeforeEach(func(ctx context.Context) {
+			t.CreateLocalHostEndpoint(ctx)
+			t.CreateEndpoint(ctx, t.remoteEndpoint)
+		})
+
+		It("should not replicate routes into the configured tables", func() {
+			t.verifyNoRouteTables()
+		})
+	})
+
+	Context("on Uninstall after routes were programmed", func() {
+		It("should remove replicated routes without flushing CNI tables", func(ctx context.Context) {
+			t.CreateEndpoint(ctx, t.localEndpoint)
+			t.CreateEndpoint(ctx, t.remoteEndpoint)
+			t.verifyRouteTables()
+
+			Expect(t.handler.Uninstall(ctx)).To(Succeed())
+
+			t.verifyNoRouteTables()
 		})
 	})
 }

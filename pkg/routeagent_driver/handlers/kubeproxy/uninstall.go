@@ -48,6 +48,7 @@ func (kp *SyncHandler) Uninstall(_ context.Context) error {
 			constants.RouteAgentHostNetworkTableID, err)
 	}
 
+	kp.cleanVxSubmarinerRoutes()
 	kp.deleteVxLANInterface()
 	kp.deleteIPTableChains()
 

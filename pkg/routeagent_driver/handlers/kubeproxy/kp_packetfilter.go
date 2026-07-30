@@ -61,6 +61,10 @@ type SyncHandler struct {
 	defaultHostIface       netlink.NetworkInterface
 	activeEndpointHostname string
 	vtepPrefixCIDR         string
+	// routeTables are optional additional Linux PBR tables (from ConfigMap
+	// submariner-route-tables) that should receive the same inter-cluster VxLAN
+	// routes as the main table.
+	routeTables []int
 }
 
 var logger = log.Logger{Logger: logf.Log.WithName("KubeProxy")}
@@ -75,7 +79,7 @@ func GetVxLANInterfaceName(ipFamily k8snet.IPFamily) string {
 	return vxlanIface
 }
 
-func NewSyncHandler(ipFamily k8snet.IPFamily, localClusterCidr, localServiceCidr []string) *SyncHandler {
+func NewSyncHandler(ipFamily k8snet.IPFamily, localClusterCidr, localServiceCidr []string, routeTables []int) *SyncHandler {
 	pFilter, err := packetfilter.New(ipFamily)
 	utilruntime.Must(err)
 
@@ -96,6 +100,7 @@ func NewSyncHandler(ipFamily k8snet.IPFamily, localClusterCidr, localServiceCidr
 		pFilter:          pFilter,
 		vtepPrefixCIDR:   vtepPrefixCIDR,
 		vxlanIface:       GetVxLANInterfaceName(ipFamily),
+		routeTables:      append([]int(nil), routeTables...),
 	}
 }
 

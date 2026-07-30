@@ -21,6 +21,7 @@ package kubeproxy
 import (
 	"io/fs"
 	"net"
+	"slices"
 
 	"github.com/pkg/errors"
 	"github.com/submariner-io/admiral/pkg/log"
@@ -175,6 +176,18 @@ func (kp *SyncHandler) cleanVxSubmarinerRoutes() {
 	for i := range currentRouteList {
 		logger.V(log.DEBUG).Infof("Processing route %v", currentRouteList[i])
 
+		if slices.Contains(kp.routeTables, currentRouteList[i].Table) {
+			if currentRouteList[i].Dst != nil &&
+				(kp.remoteSubnets.Has(currentRouteList[i].Dst.String()) ||
+					currentRouteList[i].Dst.String() == kp.vtepPrefixCIDR) {
+				if err := kp.netLink.RouteDel(&currentRouteList[i]); err != nil {
+					logger.Errorf(err, "Error removing configured-table route %s", currentRouteList[i])
+				}
+			}
+
+			continue
+		}
+
 		if currentRouteList[i].Dst == nil || currentRouteList[i].Gw == nil {
 			logger.V(log.DEBUG).Infof("Found nil gw or dst")
 		} else if kp.remoteSubnets.Has(currentRouteList[i].Dst.String()) {
@@ -228,6 +241,10 @@ func (kp *SyncHandler) reconcileRoutes(vxlanGw net.IP) error {
 		found := false
 
 		for i := range currentRouteList {
+			if !isMainRouteTable(currentRouteList[i].Table) {
+				continue
+			}
+
 			if currentRouteList[i].Gw != nil && currentRouteList[i].Dst != nil &&
 				currentRouteList[i].Gw.Equal(route.Gw) && currentRouteList[i].Dst.String() == route.Dst.String() {
 				logger.V(log.DEBUG).Infof("Found equivalent route, not adding")
@@ -244,7 +261,7 @@ func (kp *SyncHandler) reconcileRoutes(vxlanGw net.IP) error {
 		}
 	}
 
-	return nil
+	return kp.updateConfiguredRouteTables(link, kp.remoteSubnets.UnsortedList(), Add)
 }
 
 func (kp *SyncHandler) removeUnknownRoutes(vxlanGw net.IP, currentRouteList []netlink.Route) {
@@ -302,6 +319,61 @@ func (kp *SyncHandler) updateRoutingRulesForInterClusterSupport(remoteCIDRs []st
 				}
 			} else if operation == Delete {
 				err = kp.netLink.RouteDel(&route)
+				if err != nil {
+					return errors.Wrapf(err, "error deleting route %s", route)
+				}
+			}
+		}
+
+		return kp.updateConfiguredRouteTables(link, remoteCIDRs, operation)
+	}
+
+	return nil
+}
+
+func (kp *SyncHandler) updateConfiguredRouteTables(link netlink.Link, remoteCIDRs []string, operation Operation) error {
+	routes := make([]netlink.Route, 0, len(remoteCIDRs)+1)
+	for _, cidrBlock := range remoteCIDRs {
+		_, dst, err := net.ParseCIDR(cidrBlock)
+		if err != nil {
+			return errors.Wrapf(err, "error parsing cidr block %s", cidrBlock)
+		}
+
+		routes = append(routes, netlink.Route{
+			Dst:       dst,
+			Gw:        *kp.vxlanGwIP,
+			Scope:     unix.RT_SCOPE_UNIVERSE,
+			LinkIndex: link.Attrs().Index,
+			Protocol:  4,
+		})
+	}
+
+	if operation != Delete || kp.remoteSubnets.Len() == 0 {
+		_, dst, err := net.ParseCIDR(kp.vtepPrefixCIDR)
+		if err != nil {
+			return errors.Wrapf(err, "error parsing VTEP cidr %s", kp.vtepPrefixCIDR)
+		}
+
+		routes = append(routes, netlink.Route{
+			Dst:       dst,
+			Scope:     unix.RT_SCOPE_LINK,
+			LinkIndex: link.Attrs().Index,
+			Protocol:  4,
+		})
+	}
+
+	for _, table := range kp.routeTables {
+		for _, route := range routes {
+			route.Table = table
+			route.Family = netlinkAPI.ToNetlinkFamily(kp.ipFamily)
+
+			if operation == Add {
+				err := kp.netLink.RouteAddOrReplace(&route)
+				if err != nil {
+					return errors.Wrapf(err, "error adding route %s", route)
+				}
+			} else if operation == Delete {
+				err := kp.netLink.RouteDel(&route)
 				if err != nil {
 					return errors.Wrapf(err, "error deleting route %s", route)
 				}

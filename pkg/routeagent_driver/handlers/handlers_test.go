@@ -99,7 +99,7 @@ var _ = Describe("", func() {
 	})
 
 	Specify("All Route Agent handlers should successfully instantiate and initialize", func() {
-		kubeproxyHandler := kubeproxy.NewSyncHandler(k8snet.IPv4, localClusterCIDRs, localServiceCIDRs)
+		kubeproxyHandler := kubeproxy.NewSyncHandler(k8snet.IPv4, localClusterCIDRs, localServiceCIDRs, nil)
 		Expect(kubeproxyHandler.Init(ctx)).To(Succeed())
 
 		ovnHandler := ovn.NewHandler(k8snet.IPv4, &ovn.HandlerConfig{

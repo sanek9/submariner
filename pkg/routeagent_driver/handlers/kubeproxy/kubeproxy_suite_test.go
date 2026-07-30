@@ -93,6 +93,7 @@ type testDriver struct {
 	hostInterfaceAddr string
 	localClusterCIDRs []string
 	localServiceCIDRs []string
+	routeTables       []int
 }
 
 func newTestDriver() *testDriver {
@@ -131,6 +132,7 @@ func newTestDriver() *testDriver {
 
 		t.localClusterCIDRs = []string{localClusterIPv4CIDR}
 		t.localServiceCIDRs = []string{localServiceIPv4CIDR}
+		t.routeTables = nil
 	})
 
 	JustBeforeEach(func(ctx context.Context) {
@@ -145,7 +147,7 @@ func newTestDriver() *testDriver {
 
 		t.netLink.SetAllowedIPFamilies(t.ipFamily)
 
-		t.handler = kubeproxy.NewSyncHandler(t.ipFamily, t.localClusterCIDRs, t.localServiceCIDRs)
+		t.handler = kubeproxy.NewSyncHandler(t.ipFamily, t.localClusterCIDRs, t.localServiceCIDRs, t.routeTables)
 		t.Start(ctx, t.handler)
 	})
 
@@ -168,6 +170,34 @@ func (t *testDriver) verifyVxLANRoutes() {
 func (t *testDriver) verifyNoVxLANRoutes() {
 	time.Sleep(200 * time.Millisecond)
 	t.netLink.AwaitNoDstRoutes(vxLanInterfaceIndex, 0, t.remoteEndpoint.Spec.Subnets...)
+}
+
+func (t *testDriver) verifyRouteTables() {
+	linkIndex := t.awaitVxlanLink().Attrs().Index
+	remoteCIDRs := cidr.ExtractSubnets(t.ipFamily, t.remoteEndpoint.Spec.Subnets)
+	vtepCIDR := kubeproxy.VxLANVTepNetworkPrefixCIDR
+
+	if t.ipFamily == k8snet.IPv6 {
+		vtepCIDR = kubeproxy.VxLANVTepNetworkPrefixCIDRIPv6
+	}
+
+	for _, table := range t.routeTables {
+		t.netLink.AwaitDstRoutes(linkIndex, table, append(remoteCIDRs, vtepCIDR)...)
+	}
+}
+
+func (t *testDriver) verifyNoRouteTables() {
+	time.Sleep(200 * time.Millisecond)
+
+	vtepCIDR := kubeproxy.VxLANVTepNetworkPrefixCIDR
+	if t.ipFamily == k8snet.IPv6 {
+		vtepCIDR = kubeproxy.VxLANVTepNetworkPrefixCIDRIPv6
+	}
+
+	dests := append(append([]string{}, t.remoteEndpoint.Spec.Subnets...), vtepCIDR)
+	for _, table := range t.routeTables {
+		t.netLink.AwaitNoDstRoutes(vxLanInterfaceIndex, table, dests...)
+	}
 }
 
 func (t *testDriver) verifyHostNetworkingRoutes() {
