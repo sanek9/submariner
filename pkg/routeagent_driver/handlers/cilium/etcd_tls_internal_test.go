@@ -42,23 +42,17 @@ import (
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 )
 
-var _ = Describe("embedded etcd TLS with client cert auth", func() {
+var _ = Describe("kine kvstore TLS with client cert auth", func() {
 	It("should reject clients that do not present a certificate", func(ctx context.Context) {
 		dir := GinkgoT().TempDir()
 		paths := writeTestTLSBundle(dir)
 
 		clientPort := freeTCPPort()
-		peerPort := freeTCPPort()
 		clientURL := fmt.Sprintf("https://127.0.0.1:%d", clientPort)
-		peerURL := fmt.Sprintf("http://127.0.0.1:%d", peerPort)
 
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			DataDir:            filepath.Join(dir, "etcd"),
 			ListenClientURL:    clientURL,
 			AdvertiseClientURL: clientURL,
-			ListenPeerURL:      peerURL,
-			AdvertisePeerURL:   peerURL,
-			Name:               "tls-cm-reject-anon",
 			CertFile:           paths.serverCert,
 			KeyFile:            paths.serverKey,
 			CAFile:             paths.caCert,
@@ -105,9 +99,7 @@ var _ = Describe("ClusterMesh publisher TLS with client cert auth", func() {
 		paths := writeTestTLSBundle(dir)
 
 		clientPort := freeTCPPort()
-		peerPort := freeTCPPort()
 		clientURL := fmt.Sprintf("https://127.0.0.1:%d", clientPort)
-		peerURL := fmt.Sprintf("http://127.0.0.1:%d", peerPort)
 
 		support := eventtesting.NewControllerSupport()
 		h := NewClusterMeshPublisher(fakek8s.NewClientset(
@@ -119,9 +111,6 @@ var _ = Describe("ClusterMesh publisher TLS with client cert auth", func() {
 			ClusterID:          255,
 			ListenClientURL:    clientURL,
 			AdvertiseClientURL: clientURL,
-			ListenPeerURL:      peerURL,
-			AdvertisePeerURL:   peerURL,
-			DataDir:            filepath.Join(dir, "etcd"),
 			CertFile:           paths.serverCert,
 			KeyFile:            paths.serverKey,
 			CAFile:             paths.caCert,

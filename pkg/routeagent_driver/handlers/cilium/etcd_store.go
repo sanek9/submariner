@@ -20,43 +20,48 @@ package cilium
 
 import (
 	"context"
+	"crypto/tls"
 	stderrors "errors"
 	"fmt"
+	"net"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
+	"github.com/k3s-io/kine/pkg/drivers"
+	_ "github.com/k3s-io/kine/pkg/drivers/memory" // register memory:// backend
+	"github.com/k3s-io/kine/pkg/server"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/server/v3/embed"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 )
 
 const (
-	defaultEtcdReadyTimeout = 60 * time.Second
-	defaultEtcdDialTimeout  = 5 * time.Second
+	defaultEtcdDialTimeout = 5 * time.Second
+	// watchProgressInterval matches kine's default so progress notify jitter is valid.
+	watchProgressInterval = 5 * time.Second
+	grpcGracefulStopWait  = 2 * time.Second
+	loopbackHost          = "127.0.0.1"
 )
 
-// EtcdStoreConfig configures an embedded etcd used as a ClusterMesh peer.
+// EtcdStoreConfig configures an in-memory etcd-compatible ClusterMesh peer (kine).
 type EtcdStoreConfig struct {
-	DataDir            string
 	ListenClientURL    string
 	AdvertiseClientURL string
-	ListenPeerURL      string
-	AdvertisePeerURL   string
-	Name               string
 	CertFile           string
 	KeyFile            string
 	CAFile             string
 }
 
 type etcdStore struct {
-	etcd          *embed.Etcd
-	client        EtcdClient
-	dataDir       string
-	removeDataDir bool
-	closeOnce     sync.Once
+	client    EtcdClient
+	grpcSrv   *grpc.Server
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 func newEtcdStoreWithClient(client EtcdClient) *etcdStore {
@@ -66,177 +71,194 @@ func newEtcdStoreWithClient(client EtcdClient) *etcdStore {
 func startEtcdStore(ctx context.Context, cfg *EtcdStoreConfig) (*etcdStore, error) {
 	setEtcdStoreDefaults(cfg)
 
-	removeDataDir, err := prepareEtcdDataDir(cfg)
+	listenHostPort, endpointScheme, err := listenAddrAndScheme(cfg.ListenClientURL, cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	ecfg, lc, err := newEmbedEtcdConfig(cfg)
-	if err != nil {
-		if removeDataDir {
-			_ = os.RemoveAll(cfg.DataDir)
-		}
+	// Detach from the caller's cancel/deadline: the kvstore outlives Init.
+	srvCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 
+	store := &etcdStore{cancel: cancel}
+
+	_, backend, err := drivers.New(srvCtx, &store.wg, &drivers.Config{
+		Endpoint: "memory://",
+	})
+	if err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "create kine memory backend")
+	}
+
+	if err := backend.Start(srvCtx); err != nil {
+		cancel()
+		return nil, errors.Wrap(err, "start kine memory backend")
+	}
+
+	grpcSrv, err := newKineGRPCServer(cfg)
+	if err != nil {
+		cancel()
 		return nil, err
 	}
 
-	e, err := embed.StartEtcd(ecfg)
+	store.grpcSrv = grpcSrv
+	server.New(backend, endpointScheme, watchProgressInterval, "").Register(grpcSrv)
+
+	listener, err := net.Listen("tcp", listenHostPort)
 	if err != nil {
-		if removeDataDir {
-			_ = os.RemoveAll(cfg.DataDir)
+		cancel()
+		grpcSrv.Stop()
+
+		return nil, errors.Wrap(err, "listen ClusterMesh kvstore")
+	}
+
+	store.wg.Go(func() {
+		if serveErr := grpcSrv.Serve(listener); serveErr != nil && !stderrors.Is(serveErr, grpc.ErrServerStopped) {
+			logger.Errorf(serveErr, "ClusterMesh kvstore gRPC server exited")
 		}
+	})
 
-		return nil, errors.Wrap(err, "start embedded etcd")
-	}
-
-	cleanupFailedStart := func() {
-		e.Close()
-
-		if removeDataDir {
-			_ = os.RemoveAll(cfg.DataDir)
-		}
-	}
-
-	select {
-	case <-e.Server.ReadyNotify():
-	case <-time.After(defaultEtcdReadyTimeout):
-		cleanupFailedStart()
-		return nil, errors.New("embedded etcd ready timeout")
-	case <-ctx.Done():
-		cleanupFailedStart()
-		return nil, errors.Wrap(ctx.Err(), "waiting for embedded etcd")
-	}
-
-	cCfg, err := newEtcdClientConfig(cfg, ecfg, lc)
+	cli, err := newLocalEtcdClient(cfg)
 	if err != nil {
-		cleanupFailedStart()
+		_ = store.Close()
 		return nil, err
+	}
+
+	store.client = newKineEtcdClient(cli)
+
+	// Ensure the server accepts connections before returning.
+	readyCtx, readyCancel := context.WithTimeout(ctx, defaultEtcdDialTimeout)
+	defer readyCancel()
+
+	if _, err := cli.Get(readyCtx, cmHeartbeatKey); err != nil {
+		_ = store.Close()
+		return nil, errors.Wrap(err, "ClusterMesh kvstore not ready")
+	}
+
+	return store, nil
+}
+
+func newKineGRPCServer(cfg *EtcdStoreConfig) (*grpc.Server, error) {
+	opts := []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: false,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    2 * time.Hour,
+			Timeout: 20 * time.Second,
+		}),
+	}
+
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		tlsCfg, err := serverTLSConfig(cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+
+	return grpc.NewServer(opts...), nil
+}
+
+func serverTLSConfig(cfg *EtcdStoreConfig) (*tls.Config, error) {
+	// Always require client certs: Cilium agents present the ClusterMesh
+	// client cert, and the publisher's local client uses the same bundle.
+	tlsInfo := transport.TLSInfo{
+		CertFile:       cfg.CertFile,
+		KeyFile:        cfg.KeyFile,
+		TrustedCAFile:  cfg.CAFile,
+		ClientCertAuth: true,
+	}
+
+	tlsCfg, err := tlsInfo.ServerConfig()
+	if err != nil {
+		return nil, errors.Wrap(err, "ClusterMesh kvstore server TLS")
+	}
+
+	return tlsCfg, nil
+}
+
+func newLocalEtcdClient(cfg *EtcdStoreConfig) (*clientv3.Client, error) {
+	cCfg := &clientv3.Config{
+		Endpoints:   []string{localClientEndpoint(cfg)},
+		DialTimeout: defaultEtcdDialTimeout,
+	}
+
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		tlsInfo := transport.TLSInfo{
+			CertFile:      cfg.CertFile,
+			KeyFile:       cfg.KeyFile,
+			TrustedCAFile: cfg.CAFile,
+		}
+
+		tlsCfg, err := tlsInfo.ClientConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "ClusterMesh kvstore client TLS")
+		}
+
+		// Prefer loopback SAN used by publisher certs (127.0.0.1 / localhost).
+		tlsCfg.ServerName = "localhost"
+		cCfg.TLS = tlsCfg
 	}
 
 	cli, err := clientv3.New(*cCfg)
 	if err != nil {
-		cleanupFailedStart()
-		return nil, errors.Wrap(err, "create etcd client")
+		return nil, errors.Wrap(err, "create ClusterMesh kvstore client")
 	}
 
-	return &etcdStore{
-		etcd:          e,
-		client:        cli,
-		dataDir:       cfg.DataDir,
-		removeDataDir: removeDataDir,
-	}, nil
+	return cli, nil
 }
 
-func newEtcdClientConfig(cfg *EtcdStoreConfig, ecfg *embed.Config, lc *url.URL) (*clientv3.Config, error) {
-	cCfg := &clientv3.Config{
-		Endpoints:   []string{cfg.AdvertiseClientURL},
-		DialTimeout: defaultEtcdDialTimeout,
-	}
-
-	// Prefer loopback for the in-process client so TLS ServerName matches the
-	// publisher cert SANs (127.0.0.1 / localhost).
-	switch lc.Hostname() {
-	case "0.0.0.0", "", "127.0.0.1", "localhost":
-		cCfg.Endpoints = []string{fmt.Sprintf("%s://127.0.0.1:%s", lc.Scheme, lc.Port())}
-	}
-
-	if ecfg.ClientTLSInfo.Empty() {
-		return cCfg, nil
-	}
-
-	tlsCfg, err := ecfg.ClientTLSInfo.ClientConfig()
+func localClientEndpoint(cfg *EtcdStoreConfig) string {
+	u, err := url.Parse(cfg.ListenClientURL)
 	if err != nil {
-		return nil, errors.Wrap(err, "etcd client TLS")
+		return cfg.AdvertiseClientURL
 	}
 
-	// Keep certificate verification; pin ServerName to the loopback SAN.
-	tlsCfg.ServerName = "localhost"
-	cCfg.TLS = tlsCfg
+	scheme := u.Scheme
+	host := u.Hostname()
+	port := u.Port()
 
-	return cCfg, nil
+	switch host {
+	case "0.0.0.0", "", loopbackHost, "localhost":
+		host = loopbackHost
+	}
+
+	return fmt.Sprintf("%s://%s:%s", scheme, host, port)
+}
+
+func listenAddrAndScheme(listenURL string, cfg *EtcdStoreConfig) (string, string, error) {
+	u, err := url.Parse(listenURL)
+	if err != nil {
+		return "", "", errors.Wrap(err, "parse listen client URL")
+	}
+
+	if u.Port() == "" {
+		return "", "", errors.New("listen client URL must include a port")
+	}
+
+	host := u.Hostname()
+	if host == "" {
+		host = loopbackHost
+	}
+
+	scheme := "http"
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		scheme = "https"
+	}
+
+	return net.JoinHostPort(host, u.Port()), scheme, nil
 }
 
 func setEtcdStoreDefaults(cfg *EtcdStoreConfig) {
-	if cfg.Name == "" {
-		cfg.Name = "submariner-cilium-cm"
-	}
-
 	if cfg.ListenClientURL == "" {
-		cfg.ListenClientURL = "http://127.0.0.1:12379"
+		cfg.ListenClientURL = "http://" + loopbackHost + ":12379"
 	}
 
 	if cfg.AdvertiseClientURL == "" {
 		cfg.AdvertiseClientURL = cfg.ListenClientURL
 	}
-
-	if cfg.ListenPeerURL == "" {
-		cfg.ListenPeerURL = "http://127.0.0.1:12380"
-	}
-
-	if cfg.AdvertisePeerURL == "" {
-		cfg.AdvertisePeerURL = cfg.ListenPeerURL
-	}
-}
-
-func prepareEtcdDataDir(cfg *EtcdStoreConfig) (bool, error) {
-	if cfg.DataDir != "" {
-		return false, errors.Wrap(os.MkdirAll(cfg.DataDir, 0o700), "mkdir etcd data dir")
-	}
-
-	dir, err := os.MkdirTemp("", "submariner-cilium-cm-etcd-")
-	if err != nil {
-		return false, errors.Wrap(err, "create etcd data dir")
-	}
-
-	cfg.DataDir = dir
-
-	return true, nil
-}
-
-func newEmbedEtcdConfig(cfg *EtcdStoreConfig) (*embed.Config, *url.URL, error) {
-	lc, err := url.Parse(cfg.ListenClientURL)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "parse listen client URL")
-	}
-
-	ac, err := url.Parse(cfg.AdvertiseClientURL)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "parse advertise client URL")
-	}
-
-	lp, err := url.Parse(cfg.ListenPeerURL)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "parse listen peer URL")
-	}
-
-	ap, err := url.Parse(cfg.AdvertisePeerURL)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "parse advertise peer URL")
-	}
-
-	ecfg := embed.NewConfig()
-	ecfg.Name = cfg.Name
-	ecfg.Dir = cfg.DataDir
-	ecfg.Logger = "zap"
-	ecfg.LogLevel = "warn"
-	ecfg.ListenClientUrls = []url.URL{*lc}
-	ecfg.AdvertiseClientUrls = []url.URL{*ac}
-	ecfg.ListenPeerUrls = []url.URL{*lp}
-	ecfg.AdvertisePeerUrls = []url.URL{*ap}
-	ecfg.InitialCluster = ecfg.InitialClusterFromName(ecfg.Name)
-
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		// Always require client certs: Cilium agents present the ClusterMesh
-		// client cert, and the publisher's local etcd client uses the same bundle.
-		ecfg.ClientTLSInfo = transport.TLSInfo{
-			CertFile:       cfg.CertFile,
-			KeyFile:        cfg.KeyFile,
-			TrustedCAFile:  cfg.CAFile,
-			ClientCertAuth: true,
-		}
-	}
-
-	return ecfg, lc, nil
 }
 
 func (s *etcdStore) Bootstrap(ctx context.Context, remoteName string, clusterID uint32) error {
@@ -322,15 +344,26 @@ func (s *etcdStore) close() error {
 		}
 	}
 
-	if s.etcd != nil {
-		s.etcd.Close()
-	}
+	if s.grpcSrv != nil {
+		stopped := make(chan struct{})
 
-	if s.removeDataDir && s.dataDir != "" {
-		if removeErr := os.RemoveAll(s.dataDir); removeErr != nil {
-			errs = append(errs, errors.Wrap(removeErr, "remove etcd data dir"))
+		go func() {
+			s.grpcSrv.GracefulStop()
+			close(stopped)
+		}()
+
+		select {
+		case <-stopped:
+		case <-time.After(grpcGracefulStopWait):
+			s.grpcSrv.Stop()
 		}
 	}
+
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	s.wg.Wait()
 
 	return stderrors.Join(errs...)
 }

@@ -23,8 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -69,25 +67,14 @@ var _ = Describe("etcdStore", func() {
 		Expect(store.Bootstrap(ctx, "submariner", 255)).To(MatchError(ContainSubstring("put failed")))
 	})
 
-	It("should release listen ports and remove owned temp data dir on Close", func(ctx context.Context) {
+	It("should release listen ports on Close", func(ctx context.Context) {
 		clientPort := freeTCPPort()
-		peerPort := freeTCPPort()
 		clientURL := fmt.Sprintf("http://127.0.0.1:%d", clientPort)
-		peerURL := fmt.Sprintf("http://127.0.0.1:%d", peerPort)
 
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
 			ListenClientURL:    clientURL,
 			AdvertiseClientURL: clientURL,
-			ListenPeerURL:      peerURL,
-			AdvertisePeerURL:   peerURL,
-			Name:               "lifecycle-cm",
 		})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(store.dataDir).NotTo(BeEmpty())
-		Expect(store.removeDataDir).To(BeTrue())
-
-		dataDir := store.dataDir
-		_, err = os.Stat(dataDir)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(store.Bootstrap(ctx, "submariner", 255)).To(Succeed())
@@ -96,20 +83,13 @@ var _ = Describe("etcdStore", func() {
 		Expect(store.Close()).To(Succeed())
 		Expect(store.Close()).To(Succeed()) // sync.Once — idempotent
 
-		Eventually(func() bool {
-			_, err := os.Stat(dataDir)
-			return os.IsNotExist(err)
-		}).Should(BeTrue())
-
 		Eventually(func() error {
 			return canListen(clientPort)
 		}).WithTimeout(5 * time.Second).Should(Succeed())
-		Expect(canListen(peerPort)).To(Succeed())
 	})
 
 	It("should fail cleanly when the listen port is already taken", func(ctx context.Context) {
 		clientPort := freeTCPPort()
-		peerPort := freeTCPPort()
 
 		blocker, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", clientPort))
 		Expect(err).NotTo(HaveOccurred())
@@ -117,24 +97,15 @@ var _ = Describe("etcdStore", func() {
 
 		_, err = startEtcdStore(ctx, &EtcdStoreConfig{
 			ListenClientURL: fmt.Sprintf("http://127.0.0.1:%d", clientPort),
-			ListenPeerURL:   fmt.Sprintf("http://127.0.0.1:%d", peerPort),
-			Name:            "port-conflict-cm",
 		})
 		Expect(err).To(HaveOccurred())
-
-		Expect(canListen(peerPort)).To(Succeed())
 	})
 
-	It("should bootstrap against a real embedded etcd", func(ctx context.Context) {
-		dir := GinkgoT().TempDir()
+	It("should bootstrap against a real in-memory kvstore", func(ctx context.Context) {
 		clientPort := freeTCPPort()
-		peerPort := freeTCPPort()
 
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			DataDir:         filepath.Join(dir, "etcd"),
 			ListenClientURL: "http://127.0.0.1:" + strconv.Itoa(clientPort),
-			ListenPeerURL:   "http://127.0.0.1:" + strconv.Itoa(peerPort),
-			Name:            "test-cm",
 		})
 		Expect(err).NotTo(HaveOccurred())
 		DeferCleanup(func() {

@@ -18,12 +18,13 @@ limitations under the License.
 
 // Package cilium provides a Route Agent handler for clusters using the Cilium CNI.
 //
-// The ClusterMesh publisher embeds etcd and publishes remote Submariner CIDRs as
-// Cilium ClusterMesh IPIdentityPair keys (CIDR→HostIP) so Host:BPF agents program
-// ipcache tunnelendpoint. It activates when SUBMARINER_NETWORKPLUGIN=cilium.
-// Incompatible with real Cilium ClusterMesh unless carefully isolated (alpha).
-// Cert paths/URLs via SUBMARINER_CILIUM_CM_* env. Operator/subctl should distribute
-// matching TLS material to route-agent and Secret cilium-clustermesh.
+// The ClusterMesh publisher runs an in-memory etcd-compatible kvstore (kine) and
+// publishes remote Submariner CIDRs as Cilium ClusterMesh IPIdentityPair keys
+// (CIDR→HostIP) so Host:BPF agents program ipcache tunnelendpoint. It activates
+// when SUBMARINER_NETWORKPLUGIN=cilium. Incompatible with real Cilium ClusterMesh
+// unless carefully isolated (alpha). Cert paths/URLs via SUBMARINER_CILIUM_CM_*
+// env. Operator/subctl should distribute matching TLS material to route-agent and
+// Secret cilium-clustermesh.
 //
 // See https://github.com/submariner-io/submariner/issues/3168.
 package cilium
@@ -56,7 +57,6 @@ const (
 	// Cilium cluster-id must not use this value (see operator/subctl checks).
 	defaultCMClusterID = uint32(255)
 	defaultCMClientURL = "http://127.0.0.1:12379"
-	defaultCMPeerURL   = "http://127.0.0.1:12380"
 
 	// reconcileTimeout bounds event-driven reconciles so a stuck apiserver
 	// cannot block Stop/shutdown indefinitely.
@@ -65,15 +65,12 @@ const (
 
 // PublisherConfig configures the ClusterMesh-compatible CIDR publisher.
 type PublisherConfig struct {
-	// EtcdClient, when set, backs the store without starting embedded etcd (tests).
+	// EtcdClient, when set, backs the store without starting the kvstore (tests).
 	EtcdClient EtcdClient
 	// RemoteName is the synthetic Cilium ClusterMesh peer name (Secret key prefix).
 	RemoteName         string
 	ListenClientURL    string
 	AdvertiseClientURL string
-	ListenPeerURL      string
-	AdvertisePeerURL   string
-	DataDir            string
 	CertFile           string
 	KeyFile            string
 	CAFile             string
@@ -92,8 +89,6 @@ type PublisherConfig struct {
 type PublisherEnv struct {
 	CiliumCMRemoteName string `default:"submariner"             envconfig:"CILIUM_CM_REMOTE_NAME"`
 	CiliumCMListenURL  string `default:"http://127.0.0.1:12379" envconfig:"CILIUM_CM_LISTEN_URL"`
-	CiliumCMPeerURL    string `default:"http://127.0.0.1:12380" envconfig:"CILIUM_CM_PEER_URL"`
-	CiliumCMDataDir    string `envconfig:"CILIUM_CM_DATA_DIR"`
 	CiliumCMCertFile   string `envconfig:"CILIUM_CM_CERT_FILE"`
 	CiliumCMKeyFile    string `envconfig:"CILIUM_CM_KEY_FILE"`
 	CiliumCMCAFile     string `envconfig:"CILIUM_CM_CA_FILE"`
@@ -119,8 +114,8 @@ type clusterMeshPublisher struct {
 }
 
 // NewClusterMeshPublisher returns a handler that publishes remote Submariner
-// CIDRs into an embedded etcd using Cilium ClusterMesh key formats, so
-// cilium-agent programs ipcache tunnelendpoint entries (Host:BPF path).
+// CIDRs into an in-memory etcd-compatible kvstore using Cilium ClusterMesh key
+// formats, so cilium-agent programs ipcache tunnelendpoint entries (Host:BPF).
 //
 // The registry only runs it when SUBMARINER_NETWORKPLUGIN=cilium.
 func NewClusterMeshPublisher(client kubernetes.Interface, cfg *PublisherConfig) event.Handler {
@@ -149,14 +144,6 @@ func applyPublisherDefaults(cfg *PublisherConfig) {
 	if cfg.AdvertiseClientURL == "" {
 		cfg.AdvertiseClientURL = cfg.ListenClientURL
 	}
-
-	if cfg.ListenPeerURL == "" {
-		cfg.ListenPeerURL = defaultCMPeerURL
-	}
-
-	if cfg.AdvertisePeerURL == "" {
-		cfg.AdvertisePeerURL = cfg.ListenPeerURL
-	}
 }
 
 func (h *clusterMeshPublisher) GetNetworkPlugins() []string {
@@ -176,17 +163,14 @@ func (h *clusterMeshPublisher) Init(ctx context.Context) error {
 		h.store = newEtcdStoreWithClient(h.cfg.EtcdClient)
 	} else {
 		store, err := startEtcdStore(ctx, &EtcdStoreConfig{
-			DataDir:            h.cfg.DataDir,
 			ListenClientURL:    h.cfg.ListenClientURL,
 			AdvertiseClientURL: h.cfg.AdvertiseClientURL,
-			ListenPeerURL:      h.cfg.ListenPeerURL,
-			AdvertisePeerURL:   h.cfg.AdvertisePeerURL,
 			CertFile:           h.cfg.CertFile,
 			KeyFile:            h.cfg.KeyFile,
 			CAFile:             h.cfg.CAFile,
 		})
 		if err != nil {
-			return errors.Wrap(err, "start ClusterMesh publisher etcd")
+			return errors.Wrap(err, "start ClusterMesh publisher kvstore")
 		}
 
 		h.store = store
@@ -200,7 +184,7 @@ func (h *clusterMeshPublisher) Init(ctx context.Context) error {
 	h.startHeartbeat(ctx)
 
 	// Registry only calls Stop for handlers that successfully Init. If reconcile
-	// fails here, close the store ourselves to avoid leaking etcd/goroutines/ports.
+	// fails here, close the store ourselves to avoid leaking goroutines/ports.
 	if err := h.reconcile(ctx); err != nil {
 		h.stopHeartbeat()
 
@@ -215,8 +199,8 @@ func (h *clusterMeshPublisher) Init(ctx context.Context) error {
 }
 
 func (h *clusterMeshPublisher) Stop(ctx context.Context) error {
-	// Delete keys while etcd is still up so watching cilium-agents observe removals
-	// before the peer disappears. uninstall() calls StopHandlers before Uninstall.
+	// Delete keys while the kvstore is still up so watching cilium-agents observe
+	// removals before the peer disappears. uninstall() calls StopHandlers before Uninstall.
 	var err error
 
 	h.stopOnce.Do(func() {
