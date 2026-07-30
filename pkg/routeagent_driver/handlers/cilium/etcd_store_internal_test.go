@@ -118,12 +118,12 @@ var _ = Describe("etcdStore", func() {
 		Expect(store.UpsertRoute(ctx, "10.151.0.0/16", "10.0.0.2", 255)).To(Succeed())
 		Expect(store.TouchHeartbeat(ctx)).To(Succeed())
 
-		resp, err := store.client.Get(ctx, ipIdentityKey("10.151.0.0/16"))
+		raw, err := store.get(ctx, ipIdentityKey("10.151.0.0/16"))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(resp.Kvs).To(HaveLen(1))
+		Expect(raw).NotTo(BeNil())
 
 		var pair ipIdentityPair
-		Expect(json.Unmarshal(resp.Kvs[0].Value, &pair)).To(Succeed())
+		Expect(json.Unmarshal(raw, &pair)).To(Succeed())
 		Expect(pair.HostIP.String()).To(Equal("10.0.0.2"))
 	})
 

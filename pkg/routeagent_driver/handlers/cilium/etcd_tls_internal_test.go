@@ -42,7 +42,7 @@ import (
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 )
 
-var _ = Describe("kine kvstore TLS with client cert auth", func() {
+var _ = Describe("minietcd TLS with client cert auth", func() {
 	It("should reject clients that do not present a certificate", func(ctx context.Context) {
 		dir := GinkgoT().TempDir()
 		paths := writeTestTLSBundle(dir)

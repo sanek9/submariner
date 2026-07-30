@@ -18,13 +18,14 @@ limitations under the License.
 
 // Package cilium provides a Route Agent handler for clusters using the Cilium CNI.
 //
-// The ClusterMesh publisher runs an in-memory etcd-compatible kvstore (kine) and
-// publishes remote Submariner IPv4 CIDRs as Cilium ClusterMesh IPIdentityPair keys
-// (CIDR→HostIP) so Host:BPF agents program ipcache tunnelendpoint. IPv6 subnets
-// are ignored (alpha). It activates when SUBMARINER_NETWORKPLUGIN=cilium.
-// Incompatible with real Cilium ClusterMesh unless carefully isolated. Cert
-// paths/URLs via SUBMARINER_CILIUM_CM_* env. Operator/subctl should distribute
-// matching TLS material to route-agent and Secret cilium-clustermesh.
+// The ClusterMesh publisher runs a tiny in-memory etcd-compatible kvstore
+// (minietcd) and publishes remote Submariner IPv4 CIDRs as Cilium ClusterMesh
+// IPIdentityPair keys (CIDR→HostIP) so Host:BPF agents program ipcache
+// tunnelendpoint. IPv6 subnets are ignored (alpha). It activates when
+// SUBMARINER_NETWORKPLUGIN=cilium. Incompatible with real Cilium ClusterMesh
+// unless carefully isolated. Cert paths/URLs via SUBMARINER_CILIUM_CM_* env.
+// Operator/subctl should distribute matching TLS material to route-agent and
+// Secret cilium-clustermesh.
 //
 // See https://github.com/submariner-io/submariner/issues/3168.
 package cilium

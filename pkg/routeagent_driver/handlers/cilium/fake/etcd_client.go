@@ -21,12 +21,9 @@ package fake
 import (
 	"context"
 	"sync"
-
-	"go.etcd.io/etcd/api/v3/mvccpb"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// EtcdClient is an in-memory stand-in for clientv3.Client.
+// EtcdClient is an in-memory stand-in for the ClusterMesh kvstore client.
 type EtcdClient struct {
 	mutex  sync.Mutex
 	kvs    map[string][]byte
@@ -105,43 +102,38 @@ func (c *EtcdClient) Closed() bool {
 	return c.closed
 }
 
-func (c *EtcdClient) Put(_ context.Context, key, val string, _ ...clientv3.OpOption) (*clientv3.PutResponse, error) {
+func (c *EtcdClient) Put(_ context.Context, key, val string) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	if c.putErr != nil {
-		return nil, c.putErr
+		return c.putErr
 	}
 
 	c.kvs[key] = []byte(val)
 
-	return &clientv3.PutResponse{}, nil
+	return nil
 }
 
-func (c *EtcdClient) Get(_ context.Context, key string, _ ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+func (c *EtcdClient) Get(_ context.Context, key string) ([]byte, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	v, ok := c.kvs[key]
 	if !ok {
-		return &clientv3.GetResponse{}, nil
+		return nil, nil
 	}
 
-	return &clientv3.GetResponse{
-		Kvs: []*mvccpb.KeyValue{{
-			Key:   []byte(key),
-			Value: append([]byte(nil), v...),
-		}},
-	}, nil
+	return append([]byte(nil), v...), nil
 }
 
-func (c *EtcdClient) Delete(_ context.Context, key string, _ ...clientv3.OpOption) (*clientv3.DeleteResponse, error) {
+func (c *EtcdClient) Delete(_ context.Context, key string) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	delete(c.kvs, key)
 
-	return &clientv3.DeleteResponse{}, nil
+	return nil
 }
 
 func (c *EtcdClient) Close() error {

@@ -20,34 +20,22 @@ package cilium
 
 import (
 	"context"
-	"crypto/tls"
 	stderrors "errors"
-	"fmt"
 	"net"
 	"net/url"
 	"sync"
 	"time"
 
-	"github.com/k3s-io/kine/pkg/drivers"
-	_ "github.com/k3s-io/kine/pkg/drivers/memory" // register memory:// backend
-	"github.com/k3s-io/kine/pkg/server"
 	"github.com/pkg/errors"
-	"go.etcd.io/etcd/client/pkg/v3/transport"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/keepalive"
+	"github.com/submariner-io/submariner/pkg/routeagent_driver/handlers/cilium/minietcd"
 )
 
 const (
-	defaultEtcdDialTimeout = 5 * time.Second
-	// watchProgressInterval matches kine's default so progress notify jitter is valid.
-	watchProgressInterval = 5 * time.Second
-	grpcGracefulStopWait  = 2 * time.Second
-	loopbackHost          = "127.0.0.1"
+	grpcGracefulStopWait = 2 * time.Second
+	loopbackHost         = "127.0.0.1"
 )
 
-// EtcdStoreConfig configures an in-memory etcd-compatible ClusterMesh peer (kine).
+// EtcdStoreConfig configures an in-memory etcd-compatible ClusterMesh peer.
 type EtcdStoreConfig struct {
 	ListenClientURL string
 	CertFile        string
@@ -57,9 +45,8 @@ type EtcdStoreConfig struct {
 
 type etcdStore struct {
 	client    EtcdClient
-	grpcSrv   *grpc.Server
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	mem       *minietcd.Store
+	server    *minietcd.Server
 	closeOnce sync.Once
 }
 
@@ -67,174 +54,42 @@ func newEtcdStoreWithClient(client EtcdClient) *etcdStore {
 	return &etcdStore{client: client}
 }
 
-func startEtcdStore(ctx context.Context, cfg *EtcdStoreConfig) (*etcdStore, error) {
+func startEtcdStore(_ context.Context, cfg *EtcdStoreConfig) (*etcdStore, error) {
 	setEtcdStoreDefaults(cfg)
 
-	listenHostPort, endpointScheme, err := listenAddrAndScheme(cfg.ListenClientURL, cfg)
+	listenHostPort, err := listenHostPort(cfg.ListenClientURL)
 	if err != nil {
 		return nil, err
 	}
 
-	// Detach from the caller's cancel/deadline: the kvstore outlives Init.
-	srvCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-
-	store := &etcdStore{cancel: cancel}
-
-	_, backend, err := drivers.New(srvCtx, &store.wg, &drivers.Config{
-		Endpoint: "memory://",
-	})
-	if err != nil {
-		cancel()
-		return nil, errors.Wrap(err, "create kine memory backend")
-	}
-
-	if err := backend.Start(srvCtx); err != nil {
-		cancel()
-		return nil, errors.Wrap(err, "start kine memory backend")
-	}
-
-	grpcSrv, err := newKineGRPCServer(cfg)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	store.grpcSrv = grpcSrv
-	server.New(backend, endpointScheme, watchProgressInterval, "").Register(grpcSrv)
-
-	listener, err := net.Listen("tcp", listenHostPort)
-	if err != nil {
-		cancel()
-		grpcSrv.Stop()
-
-		return nil, errors.Wrap(err, "listen ClusterMesh kvstore")
-	}
-
-	store.wg.Go(func() {
-		if serveErr := grpcSrv.Serve(listener); serveErr != nil && !stderrors.Is(serveErr, grpc.ErrServerStopped) {
-			logger.Errorf(serveErr, "ClusterMesh kvstore gRPC server exited")
-		}
-	})
-
-	cli, err := newLocalEtcdClient(cfg)
-	if err != nil {
-		_ = store.Close()
-		return nil, err
-	}
-
-	store.client = newKineEtcdClient(cli)
-
-	// Ensure the server accepts connections before returning.
-	readyCtx, readyCancel := context.WithTimeout(ctx, defaultEtcdDialTimeout)
-	defer readyCancel()
-
-	if _, err := cli.Get(readyCtx, cmHeartbeatKey); err != nil {
-		_ = store.Close()
-		return nil, errors.Wrap(err, "ClusterMesh kvstore not ready")
-	}
-
-	return store, nil
-}
-
-func newKineGRPCServer(cfg *EtcdStoreConfig) (*grpc.Server, error) {
-	opts := []grpc.ServerOption{
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             5 * time.Second,
-			PermitWithoutStream: false,
-		}),
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Time:    2 * time.Hour,
-			Timeout: 20 * time.Second,
-		}),
-	}
-
+	var tlsCfg *minietcd.TLSConfig
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		tlsCfg, err := serverTLSConfig(cfg)
-		if err != nil {
-			return nil, err
+		tlsCfg = &minietcd.TLSConfig{
+			CertFile: cfg.CertFile,
+			KeyFile:  cfg.KeyFile,
+			CAFile:   cfg.CAFile,
 		}
-
-		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsCfg)))
 	}
 
-	return grpc.NewServer(opts...), nil
-}
-
-func serverTLSConfig(cfg *EtcdStoreConfig) (*tls.Config, error) {
-	// Always require client certs: Cilium agents present the ClusterMesh
-	// client cert, and the publisher's local client uses the same bundle.
-	tlsInfo := transport.TLSInfo{
-		CertFile:       cfg.CertFile,
-		KeyFile:        cfg.KeyFile,
-		TrustedCAFile:  cfg.CAFile,
-		ClientCertAuth: true,
-	}
-
-	tlsCfg, err := tlsInfo.ServerConfig()
+	srv, mem, err := minietcd.ListenAndServe(listenHostPort, tlsCfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "ClusterMesh kvstore server TLS")
+		return nil, errors.Wrap(err, "start ClusterMesh kvstore")
 	}
 
-	return tlsCfg, nil
+	return &etcdStore{
+		mem:    mem,
+		server: srv,
+	}, nil
 }
 
-func newLocalEtcdClient(cfg *EtcdStoreConfig) (*clientv3.Client, error) {
-	cCfg := &clientv3.Config{
-		Endpoints:   []string{localClientEndpoint(cfg)},
-		DialTimeout: defaultEtcdDialTimeout,
-	}
-
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		tlsInfo := transport.TLSInfo{
-			CertFile:      cfg.CertFile,
-			KeyFile:       cfg.KeyFile,
-			TrustedCAFile: cfg.CAFile,
-		}
-
-		tlsCfg, err := tlsInfo.ClientConfig()
-		if err != nil {
-			return nil, errors.Wrap(err, "ClusterMesh kvstore client TLS")
-		}
-
-		// Prefer loopback SAN used by publisher certs (127.0.0.1 / localhost).
-		tlsCfg.ServerName = "localhost"
-		cCfg.TLS = tlsCfg
-	}
-
-	cli, err := clientv3.New(*cCfg)
-	if err != nil {
-		return nil, errors.Wrap(err, "create ClusterMesh kvstore client")
-	}
-
-	return cli, nil
-}
-
-func localClientEndpoint(cfg *EtcdStoreConfig) string {
-	u, err := url.Parse(cfg.ListenClientURL)
-	if err != nil {
-		return cfg.ListenClientURL
-	}
-
-	scheme := u.Scheme
-	host := u.Hostname()
-	port := u.Port()
-
-	switch host {
-	case "0.0.0.0", "", loopbackHost, "localhost":
-		host = loopbackHost
-	}
-
-	return fmt.Sprintf("%s://%s:%s", scheme, host, port)
-}
-
-func listenAddrAndScheme(listenURL string, cfg *EtcdStoreConfig) (string, string, error) {
+func listenHostPort(listenURL string) (string, error) {
 	u, err := url.Parse(listenURL)
 	if err != nil {
-		return "", "", errors.Wrap(err, "parse listen client URL")
+		return "", errors.Wrap(err, "parse listen client URL")
 	}
 
 	if u.Port() == "" {
-		return "", "", errors.New("listen client URL must include a port")
+		return "", errors.New("listen client URL must include a port")
 	}
 
 	host := u.Hostname()
@@ -242,18 +97,48 @@ func listenAddrAndScheme(listenURL string, cfg *EtcdStoreConfig) (string, string
 		host = loopbackHost
 	}
 
-	scheme := "http"
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		scheme = "https"
-	}
-
-	return net.JoinHostPort(host, u.Port()), scheme, nil
+	return net.JoinHostPort(host, u.Port()), nil
 }
 
 func setEtcdStoreDefaults(cfg *EtcdStoreConfig) {
 	if cfg.ListenClientURL == "" {
 		cfg.ListenClientURL = "http://" + loopbackHost + ":12379"
 	}
+}
+
+func (s *etcdStore) put(ctx context.Context, key, val string) error {
+	if s.client != nil {
+		return errors.Wrap(s.client.Put(ctx, key, val), "put")
+	}
+
+	s.mem.Put(key, []byte(val))
+
+	return nil
+}
+
+func (s *etcdStore) get(ctx context.Context, key string) ([]byte, error) {
+	if s.client != nil {
+		v, err := s.client.Get(ctx, key)
+
+		return v, errors.Wrap(err, "get")
+	}
+
+	v, _, ok := s.mem.Get(key)
+	if !ok {
+		return nil, nil
+	}
+
+	return v, nil
+}
+
+func (s *etcdStore) delete(ctx context.Context, key string) error {
+	if s.client != nil {
+		return errors.Wrap(s.client.Delete(ctx, key), "delete")
+	}
+
+	s.mem.Delete(key)
+
+	return nil
 }
 
 func (s *etcdStore) Bootstrap(ctx context.Context, remoteName string, clusterID uint32) error {
@@ -263,7 +148,7 @@ func (s *etcdStore) Bootstrap(ctx context.Context, remoteName string, clusterID 
 	}
 
 	key := clusterConfigKey(remoteName)
-	if _, err := s.client.Put(ctx, key, string(b)); err != nil {
+	if err := s.put(ctx, key, string(b)); err != nil {
 		return errors.Wrapf(err, "put cluster-config %q", key)
 	}
 
@@ -281,7 +166,7 @@ func (s *etcdStore) UpsertRoute(ctx context.Context, cidrStr, hostIP string, clu
 		return errors.Wrap(err, "marshal IPIdentityPair")
 	}
 
-	if _, err := s.client.Put(ctx, key, string(b)); err != nil {
+	if err := s.put(ctx, key, string(b)); err != nil {
 		return errors.Wrapf(err, "put route %q", key)
 	}
 
@@ -295,7 +180,7 @@ func (s *etcdStore) DeleteRoute(ctx context.Context, cidrStr string) error {
 	}
 
 	key := ipIdentityKey(prefixString(&ipIdentityPair{IP: ip, Mask: mask}))
-	if _, err := s.client.Delete(ctx, key); err != nil {
+	if err := s.delete(ctx, key); err != nil {
 		return errors.Wrapf(err, "delete route %q", key)
 	}
 
@@ -304,7 +189,7 @@ func (s *etcdStore) DeleteRoute(ctx context.Context, cidrStr string) error {
 
 func (s *etcdStore) DeleteClusterConfig(ctx context.Context, remoteName string) error {
 	key := clusterConfigKey(remoteName)
-	if _, err := s.client.Delete(ctx, key); err != nil {
+	if err := s.delete(ctx, key); err != nil {
 		return errors.Wrapf(err, "delete cluster-config %q", key)
 	}
 
@@ -313,7 +198,7 @@ func (s *etcdStore) DeleteClusterConfig(ctx context.Context, remoteName string) 
 
 func (s *etcdStore) TouchHeartbeat(ctx context.Context) error {
 	value := time.Now().UTC().Format(time.RFC3339)
-	if _, err := s.client.Put(ctx, cmHeartbeatKey, value); err != nil {
+	if err := s.put(ctx, cmHeartbeatKey, value); err != nil {
 		return errors.Wrapf(err, "put heartbeat %q", cmHeartbeatKey)
 	}
 
@@ -339,26 +224,19 @@ func (s *etcdStore) close() error {
 		}
 	}
 
-	if s.grpcSrv != nil {
+	if s.server != nil {
 		stopped := make(chan struct{})
 
 		go func() {
-			s.grpcSrv.GracefulStop()
+			_ = s.server.Close()
 			close(stopped)
 		}()
 
 		select {
 		case <-stopped:
 		case <-time.After(grpcGracefulStopWait):
-			s.grpcSrv.Stop()
 		}
 	}
-
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	s.wg.Wait()
 
 	return stderrors.Join(errs...)
 }
